@@ -1,3 +1,5 @@
+import { canonicalRooms } from '../data/canonicalRooms'
+
 export const acuityGroups = [
   {
     id: 'c-section-under-24',
@@ -33,22 +35,27 @@ export const acuityGroups = [
   },
 ]
 
-export function getGroupId(patient) {
-  const hours = Number(patient.postpartumHours)
-  const hasTimeline = Number.isFinite(hours)
+export const deliveryWindows = [
+  {
+    id: 'under-24',
+    label: 'Under 24 hours',
+  },
+  {
+    id: 'over-24',
+    label: 'Over 24 hours',
+  },
+]
 
-  if (patient.deliveryType === 'c-section' && hasTimeline && hours < 24) {
+export function getGroupId(patient) {
+  if (patient.deliveryType === 'c-section' && patient.deliveryWindow === 'under-24') {
     return 'c-section-under-24'
   }
 
-  if (patient.deliveryType === 'vaginal' && hasTimeline && hours < 24) {
+  if (patient.deliveryType === 'vaginal' && patient.deliveryWindow === 'under-24') {
     return 'vaginal-under-24'
   }
 
-  if (
-    (patient.deliveryType === 'c-section' || patient.deliveryType === 'vaginal') &&
-    hasTimeline
-  ) {
+  if (patient.deliveryType === 'c-section' || patient.deliveryType === 'vaginal') {
     return 'post-24'
   }
 
@@ -65,17 +72,15 @@ export function getGroupMeta(patientOrGroupId) {
 }
 
 function sortWithinGroup(leftPatient, rightPatient) {
-  const leftHours =
-    leftPatient.postpartumHours === ''
-      ? Number.POSITIVE_INFINITY
-      : Number(leftPatient.postpartumHours)
-  const rightHours =
-    rightPatient.postpartumHours === ''
-      ? Number.POSITIVE_INFINITY
-      : Number(rightPatient.postpartumHours)
+  if (leftPatient.birthTime && rightPatient.birthTime && leftPatient.birthTime !== rightPatient.birthTime) {
+    return leftPatient.birthTime.localeCompare(rightPatient.birthTime)
+  }
 
-  if (leftHours !== rightHours) {
-    return leftHours - rightHours
+  const leftRoomIndex = canonicalRooms.indexOf(leftPatient.room)
+  const rightRoomIndex = canonicalRooms.indexOf(rightPatient.room)
+
+  if (leftRoomIndex !== -1 && rightRoomIndex !== -1 && leftRoomIndex !== rightRoomIndex) {
+    return leftRoomIndex - rightRoomIndex
   }
 
   return leftPatient.room.localeCompare(rightPatient.room)
@@ -145,11 +150,16 @@ export function assignPatientsToNurses(patients, nurseCount) {
 }
 
 export function formatTimeline(patient) {
-  const hours = Number(patient.postpartumHours)
-
-  if (!Number.isFinite(hours)) {
+  if (patient.deliveryType === 'other') {
     return 'No delivery clock'
   }
 
-  return `${hours} hours from delivery`
+  const windowLabel =
+    patient.deliveryWindow === 'under-24' ? 'Under 24 hours' : 'Over 24 hours'
+
+  if (!patient.birthTime) {
+    return windowLabel
+  }
+
+  return `Birth ${patient.birthTime} | ${windowLabel}`
 }

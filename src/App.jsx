@@ -1,9 +1,11 @@
 import { startTransition, useMemo, useState } from 'react'
 import './App.css'
+import { canonicalRooms } from './data/canonicalRooms'
 import { samplePatients } from './data/samplePatients'
 import {
   acuityGroups,
   assignPatientsToNurses,
+  deliveryWindows,
   formatTimeline,
   getGroupMeta,
 } from './utils/assignment'
@@ -67,6 +69,96 @@ function statLabelFromGroup(groupId) {
   return 'no timeline'
 }
 
+function buildAssignmentReport(assignment, lastBalancedAt) {
+  const lines = [
+    'Charge Assignment Report',
+    `Balanced at: ${lastBalancedAt}`,
+    `Nurses: ${assignment.nurses.length}`,
+    `Room spread: ${assignment.fairness.totalSpread}`,
+    `High-acuity spread: ${assignment.fairness.highAcuitySpread}`,
+    '',
+  ]
+
+  assignment.nurses.forEach((nurse) => {
+    lines.push(`${nurse.id} (${nurse.patientCount} rooms, score ${nurse.workloadScore})`)
+
+    nurse.patients.forEach((patient) => {
+      const groupMeta = getGroupMeta(patient.groupId)
+      const detailParts = [groupMeta.shortLabel, formatTimeline(patient)]
+
+      if (patient.notes?.trim()) {
+        detailParts.push(patient.notes.trim())
+      }
+
+      lines.push(`- Room ${patient.room}: ${detailParts.join(' | ')}`)
+    })
+
+    lines.push('')
+  })
+
+  return lines.join('\n').trim()
+}
+
+const defaultSectionState = {
+  setup: true,
+  census: true,
+  assignments: true,
+  queue: false,
+  validation: false,
+}
+
+function CollapsibleSection({
+  sectionId,
+  isOpen,
+  onToggle,
+  eyebrow,
+  title,
+  badge,
+  toolbar,
+  action,
+  summary,
+  children,
+}) {
+  return (
+    <section
+      className={`surface section-card accordion-card ${isOpen ? 'is-open' : 'is-collapsed'}`}
+    >
+      <button
+        type="button"
+        className="accordion-trigger"
+        onClick={() => onToggle(sectionId)}
+        aria-expanded={isOpen}
+        aria-controls={`${sectionId}-panel`}
+      >
+        <div className="accordion-copy">
+          <p className="eyebrow">{eyebrow}</p>
+          <div className="accordion-title-row">
+            <h2>{title}</h2>
+            {badge ? <span className="accordion-badge">{badge}</span> : null}
+          </div>
+          {summary ? <p className="accordion-summary">{summary}</p> : null}
+        </div>
+        <div className={`accordion-icon ${isOpen ? 'is-open' : ''}`}>
+          <span className="accordion-icon-line"></span>
+          <span className="accordion-icon-line"></span>
+        </div>
+      </button>
+
+      {isOpen ? (
+        <div id={`${sectionId}-panel`} className="accordion-panel">
+          {(toolbar || action) ? (
+            <div className="accordion-toolbar">
+              {toolbar}
+              {action}
+            </div>
+          ) : null}
+          <div className="accordion-body">{children}</div>
+        </div>
+      ) : null}
+    </section>
+  )
+}
+
 function App() {
   const [nurseCount, setNurseCount] = useState(4)
   const [patients, setPatients] = useState(() => clonePatients(samplePatients))
@@ -83,10 +175,16 @@ function App() {
     readStoredList(feedbackStorageKey),
   )
   const [feedbackForm, setFeedbackForm] = useState(feedbackSeed)
+  const [openSections, setOpenSections] = useState(defaultSectionState)
+  const [reportStatus, setReportStatus] = useState('')
 
   const assignment = useMemo(
     () => assignPatientsToNurses(patients, nurseCount),
     [patients, nurseCount],
+  )
+  const assignmentReport = useMemo(
+    () => buildAssignmentReport(assignment, lastBalancedAt),
+    [assignment, lastBalancedAt],
   )
 
   function logEvent(type, detail) {
@@ -138,11 +236,10 @@ function App() {
             return patient
           }
 
-          if (field === 'postpartumHours') {
+          if (field === 'birthTime') {
             return {
               ...patient,
-              postpartumHours:
-                value === '' ? '' : Math.min(240, Math.max(0, Number(value))),
+              birthTime: value,
             }
           }
 
@@ -150,7 +247,17 @@ function App() {
             return {
               ...patient,
               deliveryType: value,
-              postpartumHours: '',
+              birthTime: '',
+              deliveryWindow: '',
+            }
+          }
+
+          if (field === 'deliveryType') {
+            return {
+              ...patient,
+              deliveryType: value,
+              birthTime: patient.birthTime || '08:00',
+              deliveryWindow: patient.deliveryWindow || 'under-24',
             }
           }
 
@@ -164,13 +271,20 @@ function App() {
   }
 
   function handleAddPatient() {
-    const nextIndex = patients.length + 1
+    const usedRooms = new Set(patients.map((patient) => patient.room))
+    const nextRoom = canonicalRooms.find((room) => !usedRooms.has(room))
+
+    if (!nextRoom) {
+      logEvent('patient_add_blocked', 'All canonical rooms are already in use')
+      return
+    }
+
     const nextPatient = {
       id: createId('patient'),
-      name: `New patient ${nextIndex}`,
-      room: `TBD-${nextIndex}`,
+      room: nextRoom,
       deliveryType: 'vaginal',
-      postpartumHours: 8,
+      birthTime: '08:00',
+      deliveryWindow: 'under-24',
       notes: 'Needs bedside report review',
     }
 
@@ -178,7 +292,7 @@ function App() {
       setPatients((currentPatients) => [...currentPatients, nextPatient])
     })
 
-    refreshBalance('patient_added', `${nextPatient.name} added to the census`)
+    refreshBalance('patient_added', `Room ${nextPatient.room} added to the census`)
   }
 
   function handleRemovePatient(patientId) {
@@ -192,7 +306,7 @@ function App() {
 
     refreshBalance(
       'patient_removed',
-      patient ? `${patient.name} removed from the census` : 'Patient removed',
+      patient ? `Room ${patient.room} removed from the census` : 'Patient removed',
     )
   }
 
@@ -208,7 +322,7 @@ function App() {
   function handleRebalance() {
     refreshBalance(
       'assignment_run',
-      `Balanced ${patients.length} patients across ${nurseCount} nurses`,
+      `Balanced ${patients.length} rooms across ${nurseCount} nurses`,
     )
   }
 
@@ -240,6 +354,37 @@ function App() {
     )
   }
 
+  function toggleSection(sectionId) {
+    setOpenSections((currentSections) => ({
+      ...currentSections,
+      [sectionId]: !currentSections[sectionId],
+    }))
+  }
+
+  function setAllSections(isOpen) {
+    setOpenSections({
+      setup: isOpen,
+      census: isOpen,
+      assignments: isOpen,
+      queue: isOpen,
+      validation: isOpen,
+    })
+  }
+
+  function handleDownloadAssignments() {
+    const reportBlob = new Blob([assignmentReport], { type: 'text/plain;charset=utf-8' })
+    const reportUrl = URL.createObjectURL(reportBlob)
+    const link = document.createElement('a')
+    const fileStamp = lastBalancedAt.replace(/[^0-9A-Za-z]/g, '-')
+
+    link.href = reportUrl
+    link.download = `charge-assignments-${fileStamp || 'report'}.txt`
+    link.click()
+    URL.revokeObjectURL(reportUrl)
+    setReportStatus('Assignment report downloaded.')
+    logEvent('assignment_report_downloaded', 'Downloaded assignment report as text')
+  }
+
   const groupedOverview = assignment.groupedPatients.map((group) => ({
     ...group,
     label: getGroupMeta(group.id).label,
@@ -247,9 +392,9 @@ function App() {
 
   const topMetrics = [
     {
-      label: 'Patients',
+      label: 'Rooms',
       value: patients.length,
-      detail: `${assignment.fairness.totalSpread} patient spread`,
+      detail: `${assignment.fairness.totalSpread} room spread`,
     },
     {
       label: 'High acuity spread',
@@ -280,11 +425,31 @@ function App() {
             patients.
           </p>
           <div className="hero-actions">
-            <button type="button" className="primary-button" onClick={handleRebalance}>
+            <button
+              type="button"
+              className="primary-button desktop-primary-action"
+              onClick={handleRebalance}
+            >
               Deal assignments
             </button>
             <button type="button" className="secondary-button" onClick={handleResetCensus}>
               Reset sample census
+            </button>
+          </div>
+          <div className="section-manager">
+            <button
+              type="button"
+              className="secondary-button"
+              onClick={() => setAllSections(true)}
+            >
+              Expand all sections
+            </button>
+            <button
+              type="button"
+              className="secondary-button"
+              onClick={() => setAllSections(false)}
+            >
+              Collapse all sections
             </button>
           </div>
         </div>
@@ -309,19 +474,33 @@ function App() {
         </div>
       </section>
 
+      <button
+        type="button"
+        className="mobile-float-action"
+        onClick={handleRebalance}
+        aria-label="Deal assignments"
+      >
+        Deal assignments
+      </button>
+
       <section className="content-grid">
         <div className="main-column">
-          <section className="surface section-card">
-            <div className="section-heading">
-              <div>
-                <p className="eyebrow">Inputs</p>
-                <h2>Shift setup</h2>
-              </div>
-              <div className="meta-chip">
-                Last balanced at <strong>{lastBalancedAt}</strong>
-              </div>
-            </div>
-
+          <CollapsibleSection
+            sectionId="setup"
+            isOpen={openSections.setup}
+            onToggle={toggleSection}
+            eyebrow="Inputs"
+            title="Shift setup"
+            badge={`${nurseCount} nurses`}
+            toolbar={
+              <>
+                <div className="meta-chip">
+                  Last balanced at <strong>{lastBalancedAt}</strong>
+                </div>
+              </>
+            }
+            summary={`Allocator deals ${patients.length} rooms across ${nurseCount} nurses by acuity order.`}
+          >
             <div className="control-row">
               <label className="field field-compact">
                 <span>Nurses on shift</span>
@@ -342,22 +521,36 @@ function App() {
                 </p>
               </div>
             </div>
-          </section>
+          </CollapsibleSection>
 
-          <section className="surface section-card">
-            <div className="section-heading">
-              <div>
-                <p className="eyebrow">Editable census</p>
-                <h2>Patients waiting for assignment</h2>
-              </div>
-              <button type="button" className="secondary-button" onClick={handleAddPatient}>
-                Add patient
+          <CollapsibleSection
+            sectionId="census"
+            isOpen={openSections.census}
+            onToggle={toggleSection}
+            eyebrow="Editable census"
+            title="Rooms waiting for assignment"
+            badge={`${patients.length} rooms`}
+            action={
+              <button
+                type="button"
+                className="secondary-button"
+                onClick={handleAddPatient}
+              >
+                Add room
               </button>
-            </div>
-
+            }
+            summary={`${patients.length} occupied rooms ready for balancing.`}
+          >
             <div className="patient-list">
-              {patients.map((patient) => {
+              {patients.map((patient, index) => {
                 const groupMeta = getGroupMeta(patient)
+                const roomOptions = canonicalRooms.filter((room) => {
+                  if (room === patient.room) {
+                    return true
+                  }
+
+                  return !patients.some((entry) => entry.room === room)
+                })
 
                 return (
                   <article key={patient.id} className="patient-card">
@@ -379,24 +572,8 @@ function App() {
 
                     <div className="form-grid">
                       <label className="field">
-                        <span>Patient</span>
-                        <input
-                          type="text"
-                          value={patient.name}
-                          onChange={(event) =>
-                            handlePatientChange(
-                              patient.id,
-                              'name',
-                              event.target.value,
-                            )
-                          }
-                        />
-                      </label>
-
-                      <label className="field">
                         <span>Room</span>
-                        <input
-                          type="text"
+                        <select
                           value={patient.room}
                           onChange={(event) =>
                             handlePatientChange(
@@ -405,7 +582,18 @@ function App() {
                               event.target.value,
                             )
                           }
-                        />
+                        >
+                          {roomOptions.map((room) => (
+                            <option key={room} value={room}>
+                              {room}
+                            </option>
+                          ))}
+                        </select>
+                      </label>
+
+                      <label className="field">
+                        <span>Census row</span>
+                        <input type="text" value={`Room assignment ${index + 1}`} disabled />
                       </label>
 
                       <label className="field">
@@ -427,21 +615,44 @@ function App() {
                       </label>
 
                       <label className="field">
-                        <span>Hours since delivery</span>
+                        <span>Birth time</span>
                         <input
-                          type="number"
-                          min="0"
-                          max="240"
-                          value={patient.postpartumHours}
+                          type="time"
+                          value={patient.birthTime}
                           disabled={patient.deliveryType === 'other'}
                           onChange={(event) =>
                             handlePatientChange(
                               patient.id,
-                              'postpartumHours',
+                              'birthTime',
                               event.target.value,
                             )
                           }
                         />
+                      </label>
+
+                      <label className="field">
+                        <span>24-hour status</span>
+                        <div className="toggle-group">
+                          {deliveryWindows.map((windowOption) => (
+                            <button
+                              key={windowOption.id}
+                              type="button"
+                              className={`toggle-chip ${
+                                patient.deliveryWindow === windowOption.id ? 'is-active' : ''
+                              }`}
+                              disabled={patient.deliveryType === 'other'}
+                              onClick={() =>
+                                handlePatientChange(
+                                  patient.id,
+                                  'deliveryWindow',
+                                  windowOption.id,
+                                )
+                              }
+                            >
+                              {windowOption.label}
+                            </button>
+                          ))}
+                        </div>
                       </label>
 
                       <label className="field field-wide">
@@ -463,26 +674,58 @@ function App() {
                 )
               })}
             </div>
-          </section>
+          </CollapsibleSection>
 
-          <section className="surface section-card">
-            <div className="section-heading">
-              <div>
-                <p className="eyebrow">Balanced output</p>
-                <h2>Recommended assignments</h2>
+          <CollapsibleSection
+            sectionId="assignments"
+            isOpen={openSections.assignments}
+            onToggle={toggleSection}
+            eyebrow="Balanced output"
+            title="Recommended assignments"
+            badge={`${assignment.fairness.totalSpread} spread`}
+            toolbar={
+              <>
+                <div className="meta-chip">
+                  {assignment.nurses.length} nurses, {patients.length} rooms
+                </div>
+                <div className="toolbar-actions">
+                  <button
+                    type="button"
+                    className="primary-button"
+                    onClick={handleDownloadAssignments}
+                  >
+                    Download assignments
+                  </button>
+                </div>
+              </>
+            }
+            summary={`Spread: ${assignment.fairness.totalSpread} rooms, ${assignment.fairness.highAcuitySpread} high-acuity difference.`}
+          >
+            <div className="export-card">
+              <div className="export-card-top">
+                <div>
+                  <p className="eyebrow">Output</p>
+                  <h3>Shareable assignment report</h3>
+                </div>
+                {reportStatus ? <p className="export-status">{reportStatus}</p> : null}
               </div>
-              <div className="meta-chip">
-                {assignment.nurses.length} nurses, {patients.length} patients
-              </div>
+              <label className="field">
+                <span>Ready to download or share</span>
+                <textarea
+                  className="report-box"
+                  rows="12"
+                  value={assignmentReport}
+                  readOnly
+                />
+              </label>
             </div>
-
             <div className="nurse-grid">
               {assignment.nurses.map((nurse) => (
                 <article key={nurse.id} className="nurse-card">
                   <header className="nurse-header">
                     <div>
                       <p className="eyebrow">{nurse.id}</p>
-                      <h3>{nurse.patientCount} patients assigned</h3>
+                      <h3>{nurse.patientCount} rooms assigned</h3>
                     </div>
                     <div className="score-badge">
                       Score <strong>{nurse.workloadScore}</strong>
@@ -506,7 +749,7 @@ function App() {
                         <div key={patient.id} className="assigned-patient">
                           <div>
                             <p className="patient-room">{patient.room}</p>
-                            <strong>{patient.name}</strong>
+                            <strong>{patient.notes}</strong>
                           </div>
                           <div className="assigned-meta">
                             <span className={`acuity-pill ${groupMeta.tone}`}>
@@ -521,25 +764,28 @@ function App() {
                 </article>
               ))}
             </div>
-          </section>
+          </CollapsibleSection>
         </div>
 
         <aside className="side-column">
-          <section className="surface section-card">
-            <div className="section-heading">
-              <div>
-                <p className="eyebrow">Queue by acuity</p>
-                <h2>Deal order</h2>
-              </div>
-            </div>
-
+          <CollapsibleSection
+            sectionId="queue"
+            isOpen={openSections.queue}
+            onToggle={toggleSection}
+            eyebrow="Queue by acuity"
+            title="Deal order"
+            badge={`${groupedOverview.length} bands`}
+            summary={groupedOverview
+              .map((group) => `${group.patients.length} in ${group.label}`)
+              .join(' · ')}
+          >
             <div className="queue-list">
               {groupedOverview.map((group) => (
                 <article key={group.id} className="queue-card">
                   <div className="queue-heading">
                     <div>
                       <h3>{group.label}</h3>
-                      <p>{group.patients.length} patients in this hand</p>
+                      <p>{group.patients.length} rooms in this hand</p>
                     </div>
                     <span className={`acuity-pill ${getGroupMeta(group.id).tone}`}>
                       Priority {getGroupMeta(group.id).priority}
@@ -549,23 +795,24 @@ function App() {
                   <div className="queue-pills">
                     {group.patients.map((patient) => (
                       <span key={patient.id} className="queue-pill">
-                        {patient.room} {patient.name}
+                        Room {patient.room}
                       </span>
                     ))}
                   </div>
                 </article>
               ))}
             </div>
-          </section>
+          </CollapsibleSection>
 
-          <section className="surface section-card">
-            <div className="section-heading">
-              <div>
-                <p className="eyebrow">Validation</p>
-                <h2>Prototype learning loop</h2>
-              </div>
-            </div>
-
+          <CollapsibleSection
+            sectionId="validation"
+            isOpen={openSections.validation}
+            onToggle={toggleSection}
+            eyebrow="Validation"
+            title="Prototype learning loop"
+            badge={`${analyticsEvents.length + feedbackEntries.length} signals`}
+            summary={`${analyticsEvents.length} signals and ${feedbackEntries.length} feedback entries captured locally.`}
+          >
             <div className="validation-panel">
               <div className="validation-copy">
                 <h3>Hypothesis</h3>
@@ -682,7 +929,7 @@ function App() {
                 </ul>
               </div>
             </div>
-          </section>
+          </CollapsibleSection>
         </aside>
       </section>
     </main>
